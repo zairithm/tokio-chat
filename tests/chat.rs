@@ -121,6 +121,85 @@ async fn unnamed_clients_hear_nothing() {
 }
 
 #[tokio::test]
+async fn who_lists_everyone() {
+    let addr = start_server().await;
+    let mut alice = Client::join(addr, "alice").await;
+    let _bob = Client::join(addr, "Bob").await;
+    assert_eq!(alice.recv().await, "* Bob joined");
+
+    alice.send("/who").await;
+    assert_eq!(alice.recv().await, "2 online: alice, Bob");
+}
+
+#[tokio::test]
+async fn nick_change_is_announced_and_used() {
+    let addr = start_server().await;
+    let mut alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
+
+    alice.send("/nick ally").await;
+    assert_eq!(alice.recv().await, "You are now ally.");
+    assert_eq!(bob.recv().await, "* alice is now ally");
+    alice.send("hi").await;
+    assert_eq!(bob.recv().await, "ally: hi");
+}
+
+#[tokio::test]
+async fn taken_nickname_is_refused() {
+    let addr = start_server().await;
+    let mut alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
+
+    bob.send("/nick ALICE").await;
+    assert_eq!(bob.recv().await, "ALICE is taken.");
+
+    let mut late = Client::connect_raw(addr).await;
+    late.send("alice").await;
+    assert_eq!(late.recv().await, "alice is taken.");
+    assert_eq!(late.recv().await, tokio_chat::NICK_PROMPT);
+}
+
+#[tokio::test]
+async fn nickname_is_free_again_after_leaving() {
+    let addr = start_server().await;
+    let alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    drop(alice);
+    assert_eq!(bob.recv().await, "* alice left");
+    let _again = Client::join(addr, "alice").await;
+}
+
+#[tokio::test]
+async fn quit_says_bye_and_closes() {
+    let addr = start_server().await;
+    let mut alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
+
+    bob.send("/quit").await;
+    assert_eq!(bob.recv().await, "Bye!");
+    let closed = timeout(Duration::from_secs(2), bob.lines.next_line()).await;
+    assert!(
+        matches!(closed, Ok(Ok(None))),
+        "connection should be closed"
+    );
+    assert_eq!(alice.recv().await, "* bob left");
+}
+
+#[tokio::test]
+async fn unknown_command_shows_help() {
+    let addr = start_server().await;
+    let mut alice = Client::join(addr, "alice").await;
+    alice.send("/dance").await;
+    assert_eq!(
+        alice.recv().await,
+        format!("Unknown command /dance. {}", tokio_chat::HELP)
+    );
+}
+
+#[tokio::test]
 async fn blank_lines_are_ignored() {
     let addr = start_server().await;
     let mut alice = Client::join(addr, "alice").await;
