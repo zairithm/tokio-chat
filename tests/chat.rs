@@ -14,14 +14,23 @@ struct Client {
 }
 
 impl Client {
-    /// Connects and waits for the welcome line, so the client is subscribed.
-    async fn connect(addr: SocketAddr) -> Self {
+    /// Connects without picking a nickname yet.
+    async fn connect_raw(addr: SocketAddr) -> Self {
         let (reader, writer) = TcpStream::connect(addr).await.unwrap().into_split();
         let mut client = Self {
             lines: BufReader::new(reader).lines(),
             writer,
         };
         assert_eq!(client.recv().await, tokio_chat::WELCOME);
+        assert_eq!(client.recv().await, tokio_chat::NICK_PROMPT);
+        client
+    }
+
+    /// Connects and joins as `nick`. Once the greeting arrives, the client is subscribed.
+    async fn join(addr: SocketAddr, nick: &str) -> Self {
+        let mut client = Self::connect_raw(addr).await;
+        client.send(nick).await;
+        assert!(client.recv().await.starts_with(&format!("Hi {nick}!")));
         client
     }
 
@@ -56,36 +65,69 @@ async fn start_server() -> SocketAddr {
 }
 
 #[tokio::test]
-async fn message_reaches_other_clients() {
+async fn messages_carry_the_nickname() {
     let addr = start_server().await;
-    let mut alice = Client::connect(addr).await;
-    let mut bob = Client::connect(addr).await;
-    let mut carol = Client::connect(addr).await;
+    let mut alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
 
     alice.send("hello").await;
-    assert_eq!(bob.recv().await, "hello");
-    assert_eq!(carol.recv().await, "hello");
+    assert_eq!(bob.recv().await, "alice: hello");
+    bob.send("hi alice").await;
+    assert_eq!(alice.recv().await, "bob: hi alice");
 }
 
 #[tokio::test]
 async fn sender_does_not_get_its_own_message() {
     let addr = start_server().await;
-    let mut alice = Client::connect(addr).await;
-    let mut bob = Client::connect(addr).await;
+    let mut alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
 
     alice.send("ping").await;
-    assert_eq!(bob.recv().await, "ping");
+    assert_eq!(bob.recv().await, "alice: ping");
     assert!(alice.is_quiet().await);
 }
 
 #[tokio::test]
-async fn a_client_leaving_does_not_break_the_others() {
+async fn join_and_leave_are_announced() {
     let addr = start_server().await;
-    let alice = Client::connect(addr).await;
-    let mut bob = Client::connect(addr).await;
-    let mut carol = Client::connect(addr).await;
+    let mut alice = Client::join(addr, "alice").await;
+    let bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
 
-    drop(alice);
-    bob.send("still here").await;
-    assert_eq!(carol.recv().await, "still here");
+    drop(bob);
+    assert_eq!(alice.recv().await, "* bob left");
+}
+
+#[tokio::test]
+async fn bad_nickname_is_asked_again() {
+    let addr = start_server().await;
+    let mut client = Client::connect_raw(addr).await;
+    client.send("two words").await;
+    assert_eq!(client.recv().await, "A nickname can't contain spaces.");
+    assert_eq!(client.recv().await, tokio_chat::NICK_PROMPT);
+    client.send("ok").await;
+    assert!(client.recv().await.starts_with("Hi ok!"));
+}
+
+#[tokio::test]
+async fn unnamed_clients_hear_nothing() {
+    let addr = start_server().await;
+    let mut lurker = Client::connect_raw(addr).await;
+    let mut alice = Client::join(addr, "alice").await;
+    alice.send("secret").await;
+    assert!(lurker.is_quiet().await);
+}
+
+#[tokio::test]
+async fn blank_lines_are_ignored() {
+    let addr = start_server().await;
+    let mut alice = Client::join(addr, "alice").await;
+    let mut bob = Client::join(addr, "bob").await;
+    assert_eq!(alice.recv().await, "* bob joined");
+
+    alice.send("   ").await;
+    alice.send("real").await;
+    assert_eq!(bob.recv().await, "alice: real");
 }
