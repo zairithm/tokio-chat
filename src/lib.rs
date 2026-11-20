@@ -6,16 +6,22 @@
 //! - one `tokio::sync::broadcast` channel: a client publishes into it and, at the same
 //!   time, listens on its own receiver for everyone else (`tokio::select!` waits on both);
 //! - the list of nicknames in use, behind an `Arc<Mutex<_>>`. The lock is only held for
-//!   a quick lookup or insert, never across an `.await`.
+//!   a quick lookup or insert, never across an `.await`;
+//! - a `watch` channel that flips to `true` when the server shuts down, so every
+//!   connection can say goodbye and close.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 /// How many messages a slow client may fall behind before it starts skipping.
 const CHANNEL_CAPACITY: usize = 256;
@@ -28,6 +34,10 @@ pub const WELCOME: &str = "Welcome to tokio-chat!";
 pub const NICK_PROMPT: &str = "Choose a nickname:";
 /// Shown for `/help` and unknown commands.
 pub const HELP: &str = "Commands: /nick <name>, /who, /help, /quit";
+/// Sent to every client when the server shuts down.
+pub const SHUTDOWN_NOTICE: &str = "Server is shutting down. Bye!";
+/// How long shutdown waits for connections to finish saying goodbye.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct Message {
@@ -40,6 +50,8 @@ struct Message {
 struct Shared {
     tx: broadcast::Sender<Message>,
     users: Arc<Mutex<HashMap<SocketAddr, String>>>,
+    /// Becomes `true` when the server is shutting down.
+    stop: watch::Receiver<bool>,
 }
 
 impl Shared {
@@ -73,21 +85,55 @@ impl Shared {
 
 /// Accepts clients forever, handling each one on its own task.
 pub async fn run(listener: TcpListener) -> std::io::Result<()> {
+    run_until(listener, std::future::pending()).await
+}
+
+/// Like [`run`], but stops when `shutdown` completes: no new clients are accepted,
+/// every connected client is told the server is closing, and this returns once they
+/// have all disconnected (or after a short grace period).
+pub async fn run_until(
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()>,
+) -> std::io::Result<()> {
     let (tx, _) = broadcast::channel::<Message>(CHANNEL_CAPACITY);
+    let (stop_tx, stop) = watch::channel(false);
     let shared = Shared {
         tx,
         users: Arc::default(),
+        stop,
     };
+    let mut clients = JoinSet::new();
+    tokio::pin!(shutdown);
+
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle(socket, peer, &shared).await {
-                eprintln!("{peer}: {e}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted?;
+                let shared = shared.clone();
+                clients.spawn(async move {
+                    if let Err(e) = handle(socket, peer, &shared).await {
+                        eprintln!("{peer}: {e}");
+                    }
+                    shared.release(peer);
+                });
             }
-            shared.release(peer);
-        });
+            () = &mut shutdown => break,
+        }
+        // Forget connections that already finished, so the set doesn't grow forever.
+        while clients.try_join_next().is_some() {}
     }
+
+    drop(listener); // stop accepting right away
+    let _ = stop_tx.send(true);
+    let all_closed = async { while clients.join_next().await.is_some() {} };
+    if tokio::time::timeout(SHUTDOWN_GRACE, all_closed)
+        .await
+        .is_err()
+    {
+        eprintln!("some clients did not disconnect in time; closing them");
+        clients.abort_all();
+    }
+    Ok(())
 }
 
 /// Checks a nickname and explains what is wrong with it.
@@ -142,16 +188,25 @@ async fn send_line(writer: &mut OwnedWriteHalf, line: &str) -> std::io::Result<(
     writer.write_all(format!("{line}\n").as_bytes()).await
 }
 
-/// Asks until a valid, unused nickname arrives. `None` if the client hung up first.
+/// Asks until a valid, unused nickname arrives.
+/// `None` if the client hung up first or the server is shutting down.
 async fn ask_nick(
     lines: &mut Lines<BufReader<OwnedReadHalf>>,
     writer: &mut OwnedWriteHalf,
     shared: &Shared,
     peer: SocketAddr,
+    stop: &mut watch::Receiver<bool>,
 ) -> std::io::Result<Option<String>> {
     loop {
         send_line(writer, NICK_PROMPT).await?;
-        let Some(line) = lines.next_line().await? else {
+        let line = tokio::select! {
+            line = lines.next_line() => line?,
+            _ = stop.changed() => {
+                send_line(writer, SHUTDOWN_NOTICE).await?;
+                return Ok(None);
+            }
+        };
+        let Some(line) = line else {
             return Ok(None);
         };
         match validate_nick(&line) {
@@ -167,7 +222,8 @@ async fn handle(socket: TcpStream, peer: SocketAddr, shared: &Shared) -> std::io
     let mut lines = BufReader::new(reader).lines();
     send_line(&mut writer, WELCOME).await?;
 
-    let Some(mut nick) = ask_nick(&mut lines, &mut writer, shared, peer).await? else {
+    let mut stop = shared.stop.clone();
+    let Some(mut nick) = ask_nick(&mut lines, &mut writer, shared, peer, &mut stop).await? else {
         return Ok(());
     };
 
@@ -176,7 +232,16 @@ async fn handle(socket: TcpStream, peer: SocketAddr, shared: &Shared) -> std::io
     shared.broadcast(peer, format!("* {nick} joined"));
     send_line(&mut writer, &format!("Hi {nick}! {HELP}")).await?;
 
-    let result = chat_loop(&mut lines, &mut writer, &mut rx, shared, peer, &mut nick).await;
+    let result = chat_loop(
+        &mut lines,
+        &mut writer,
+        &mut rx,
+        shared,
+        peer,
+        &mut nick,
+        &mut stop,
+    )
+    .await;
     shared.broadcast(peer, format!("* {nick} left"));
     result
 }
@@ -188,9 +253,14 @@ async fn chat_loop(
     shared: &Shared,
     peer: SocketAddr,
     nick: &mut String,
+    stop: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     loop {
         tokio::select! {
+            _ = stop.changed() => {
+                send_line(writer, SHUTDOWN_NOTICE).await?;
+                return Ok(());
+            }
             line = lines.next_line() => {
                 let Some(line) = line? else { return Ok(()) }; // client disconnected
                 match parse(&line) {
@@ -267,6 +337,7 @@ mod tests {
         let shared = Shared {
             tx,
             users: Arc::default(),
+            stop: watch::channel(false).1,
         };
         let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let b: SocketAddr = "127.0.0.1:2".parse().unwrap();

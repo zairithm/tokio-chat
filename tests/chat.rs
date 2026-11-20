@@ -200,6 +200,34 @@ async fn unknown_command_shows_help() {
 }
 
 #[tokio::test]
+async fn shutdown_says_bye_and_stops_the_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(tokio_chat::run_until(listener, async {
+        let _ = stopped.await;
+    }));
+
+    let mut alice = Client::join(addr, "alice").await;
+    let mut naming = Client::connect_raw(addr).await; // still choosing a nickname
+
+    stop.send(()).unwrap();
+    assert_eq!(alice.recv().await, tokio_chat::SHUTDOWN_NOTICE);
+    assert_eq!(naming.recv().await, tokio_chat::SHUTDOWN_NOTICE);
+
+    // The server task finishes on its own once everyone is gone.
+    timeout(Duration::from_secs(3), server)
+        .await
+        .expect("server did not stop")
+        .unwrap()
+        .unwrap();
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "no longer accepting"
+    );
+}
+
+#[tokio::test]
 async fn blank_lines_are_ignored() {
     let addr = start_server().await;
     let mut alice = Client::join(addr, "alice").await;
